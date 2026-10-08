@@ -1,0 +1,183 @@
+name: Deploy
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  id-token: write
+  contents: read
+
+env:
+  AGENT_NAME: outfit-suggestion-container-agent
+  ROLE_NAME: outfit-suggestion-container-agent-role
+  ECR_REPO_NAME: outfit-suggestion-container-agent
+  AWS_REGION: us-east-1
+
+jobs:
+  ci:
+    uses: ./.github/workflows/ci.yml
+
+  deploy:
+    needs: ci
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ secrets.AWS_DEPLOY_ROLE_ARN }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Resolve account ID
+        id: account
+        run: echo "id=$(aws sts get-caller-identity --query Account --output text)" >> "$GITHUB_OUTPUT"
+
+      - name: Ensure ECR repository exists
+        run: |
+          if ! aws ecr describe-repositories --repository-names "$ECR_REPO_NAME" >/dev/null 2>&1; then
+            echo "Creating ECR repository $ECR_REPO_NAME"
+            aws ecr create-repository \
+              --repository-name "$ECR_REPO_NAME" \
+              --image-scanning-configuration scanOnPush=true
+          else
+            echo "ECR repository $ECR_REPO_NAME already exists"
+          fi
+
+      - name: Log in to Amazon ECR
+        id: ecr-login
+        uses: aws-actions/amazon-ecr-login@v2
+
+      # AgentCore Runtime requires ARM64 containers (see Dockerfile).
+      # GitHub's standard ubuntu-latest runners are x86_64, so QEMU is
+      # required to cross-build for arm64 here.
+      - name: Set up QEMU for ARM64 cross-build
+        uses: docker/setup-qemu-action@v3
+        with:
+          platforms: arm64
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Build and push ARM64 image
+        uses: docker/build-push-action@v5
+        with:
+          context: .
+          platforms: linux/arm64
+          push: true
+          tags: |
+            ${{ steps.ecr-login.outputs.registry }}/${{ env.ECR_REPO_NAME }}:latest
+            ${{ steps.ecr-login.outputs.registry }}/${{ env.ECR_REPO_NAME }}:${{ github.sha }}
+
+      - name: Ensure execution role exists
+        id: role
+        run: |
+          if aws iam get-role --role-name "$ROLE_NAME" >/dev/null 2>&1; then
+            echo "Role $ROLE_NAME already exists"
+          else
+            echo "Creating $ROLE_NAME"
+            # The templates need the account ID, region, and agent name
+            # baked into their ARNs -- see iam/README.md for why these
+            # can't be static committed files.
+            sed -e "s/__ACCOUNT_ID__/${{ steps.account.outputs.id }}/g" \
+                -e "s/__REGION__/$AWS_REGION/g" \
+                iam/trust-policy.template.json > /tmp/trust-policy.json
+            sed -e "s/__ACCOUNT_ID__/${{ steps.account.outputs.id }}/g" \
+                -e "s/__REGION__/$AWS_REGION/g" \
+                -e "s/__AGENT_NAME__/$AGENT_NAME/g" \
+                iam/execution-role-policy.template.json > /tmp/execution-role-policy.json
+
+            aws iam create-role \
+              --role-name "$ROLE_NAME" \
+              --assume-role-policy-document file:///tmp/trust-policy.json
+            aws iam put-role-policy \
+              --role-name "$ROLE_NAME" \
+              --policy-name "${ROLE_NAME}-execution" \
+              --policy-document file:///tmp/execution-role-policy.json
+            echo "Waiting for IAM propagation..."
+            sleep 10
+          fi
+          ROLE_ARN=$(aws iam get-role --role-name "$ROLE_NAME" --query 'Role.Arn' --output text)
+          echo "role_arn=$ROLE_ARN" >> "$GITHUB_OUTPUT"
+
+      - name: Create or update agent runtime
+        id: runtime
+        run: |
+          CONTAINER_URI="${{ steps.ecr-login.outputs.registry }}/${{ env.ECR_REPO_NAME }}:${{ github.sha }}"
+          ARTIFACT="{\"containerConfiguration\":{\"containerUri\":\"$CONTAINER_URI\"}}"
+
+          EXISTING_ID=$(aws bedrock-agentcore-control list-agent-runtimes \
+            --query "agentRuntimes[?agentRuntimeName=='${AGENT_NAME}'].agentRuntimeId | [0]" \
+            --output text)
+
+          if [ "$EXISTING_ID" != "None" ] && [ -n "$EXISTING_ID" ]; then
+            echo "Updating existing agent runtime $EXISTING_ID"
+            aws bedrock-agentcore-control update-agent-runtime \
+              --agent-runtime-id "$EXISTING_ID" \
+              --agent-runtime-artifact "$ARTIFACT" \
+              --role-arn "${{ steps.role.outputs.role_arn }}" \
+              --network-configuration '{"networkMode":"PUBLIC"}' \
+              --protocol-configuration '{"serverProtocol":"HTTP"}' \
+              --environment-variables "{}"
+            RUNTIME_ID="$EXISTING_ID"
+            RUNTIME_ARN=$(aws bedrock-agentcore-control get-agent-runtime \
+              --agent-runtime-id "$RUNTIME_ID" --query 'agentRuntimeArn' --output text)
+          else
+            echo "Creating new agent runtime"
+            CREATE_OUTPUT=$(aws bedrock-agentcore-control create-agent-runtime \
+              --agent-runtime-name "$AGENT_NAME" \
+              --agent-runtime-artifact "$ARTIFACT" \
+              --role-arn "${{ steps.role.outputs.role_arn }}" \
+              --network-configuration '{"networkMode":"PUBLIC"}' \
+              --protocol-configuration '{"serverProtocol":"HTTP"}')
+            RUNTIME_ID=$(echo "$CREATE_OUTPUT" | python3 -c "import json,sys; print(json.load(sys.stdin)['agentRuntimeId'])")
+            RUNTIME_ARN=$(echo "$CREATE_OUTPUT" | python3 -c "import json,sys; print(json.load(sys.stdin)['agentRuntimeArn'])")
+          fi
+
+          echo "runtime_id=$RUNTIME_ID" >> "$GITHUB_OUTPUT"
+          echo "runtime_arn=$RUNTIME_ARN" >> "$GITHUB_OUTPUT"
+
+      # No `aws bedrock-agentcore-control wait` subcommand exists for
+      # this resource (unlike Lambda's function-active-v2 we hit earlier
+      # in this project), so this polls get-agent-runtime by hand. Same
+      # underlying race this guards against: invoking a runtime that's
+      # still CREATING/UPDATING fails, so we don't smoke-test until it
+      # reports READY.
+      - name: Wait for agent runtime to become READY
+        run: |
+          for attempt in $(seq 1 30); do
+            STATUS=$(aws bedrock-agentcore-control get-agent-runtime \
+              --agent-runtime-id "${{ steps.runtime.outputs.runtime_id }}" \
+              --query 'status' --output text)
+            echo "Status: $STATUS (attempt $attempt/30)"
+            if [ "$STATUS" = "READY" ]; then
+              exit 0
+            fi
+            if [ "$STATUS" = "CREATE_FAILED" ] || [ "$STATUS" = "UPDATE_FAILED" ]; then
+              echo "Agent runtime entered a failed state: $STATUS"
+              exit 1
+            fi
+            sleep 10
+          done
+          echo "Timed out waiting for agent runtime to become READY"
+          exit 1
+
+      - name: Smoke-test deployed agent runtime
+        run: |
+          SESSION_ID="ci-smoke-$(python3 -c 'import uuid; print(uuid.uuid4().hex)')"
+          aws bedrock-agentcore invoke-agent-runtime \
+            --agent-runtime-arn "${{ steps.runtime.outputs.runtime_arn }}" \
+            --runtime-session-id "$SESSION_ID" \
+            --payload '{"inputText": "68F, sunny, light breeze, 10% chance of rain"}' \
+            response.json
+          cat response.json
+          python3 -c "
+          import json
+          with open('response.json') as f:
+              body = json.load(f)
+          assert 'recommendation' in body, f'Unexpected response: {body}'
+          assert 'error' not in body, f'Smoke test got an error response: {body}'
+          print('Smoke test passed:', body)
+          "
